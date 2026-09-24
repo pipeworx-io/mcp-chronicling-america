@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-chronicling-america",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Chronicling America MCP — full-text search of ~150 years of digitized U.S.",
   "type": "module",
   "main": "src/index.ts",
@@ -24,5 +24,9 @@
   "devDependencies": {
     "typescript": "^5.9.3",
     "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-4736a1d96b0cbb828c25f9336b45caf3ea49c0f4c7649943df60c8f6bc23676e",
+    "sourceCommit": "60f04b68c347e970c6be94a53439d1364061fc06"
   }
 }

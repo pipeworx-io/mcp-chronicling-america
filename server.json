@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/chronicling-america",
   "title": "Chronicling America",
   "description": "Chronicling America MCP — full-text search of ~150 years of digitized U.S.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://pipeworx.io/packs/chronicling-america",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-chronicling-america",
