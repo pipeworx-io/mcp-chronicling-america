@@ -25,6 +25,288 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
+ * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
+ *
+ * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
+ * keying on the SQLSTATE inside PostgREST's four-key error envelope. That
+ * covered the majority and structurally could not cover the rest: the rest
+ * never reach Postgres, so they carry no SQLSTATE. What was left, measured over
+ * the 24h to 2026-09-02T15:00Z (fleet #1096):
+ *
+ *     5  pipeworx-catalog  get_pack_tools     Pipeworx catalog error: 522 — error code: 522
+ *     3  fleet             fleet_list_open …  upstream_down: Fleet task queue did not respond within 25s
+ *
+ * 521/522/523/526 are Cloudflare saying its edge could not reach an ORIGIN, and
+ * in both of those rows the origin is ours — `gateway.pipeworx.io` for the
+ * catalog pack (it self-fetches when the gateway hasn't injected a manifest),
+ * our own Supabase for fleet. There is no third party anywhere in either call.
+ * Same defect as #1089: our own outage filed under `upstream_down`, the one
+ * class that means "the source is unreachable and there is nothing for us to
+ * fix", which is why the problem-tools triage skips it.
+ *
+ * WHY NOT A WORDING RULE. The obvious fix is to match `fleet db error:` and
+ * `Pipeworx catalog error:` in classifyToolError. Each is emitted from exactly
+ * one site today, so it would work today. It would also rot the first time
+ * somebody rewords a label — silently, and in the direction of hiding our own
+ * outage, which is worse than the bug being fixed. Every prose rule in
+ * error-class.ts has needed widening as packs invented new wording (#409/#450/
+ * #584); that history is most of that file's comment budget.
+ *
+ * WHAT THIS KEYS ON INSTEAD: **the host the call actually reached.** A URL's
+ * hostname is a fact about the call, not a guess about its prose. Two
+ * consequences that a pack-level flag could not give us, and the reason the
+ * flag was rejected:
+ *
+ *   - It describes the CALL, not the pack. `govcon-intel` fans out to our own
+ *     Supabase AND to genuine third parties; `court-listener` holds our cache
+ *     in Supabase and fetches courtlistener.com. An `internallyHosted: true` on
+ *     either pack would relabel a real third-party outage as ours — inventing
+ *     work, which is the same class of error in the opposite direction.
+ *   - It covers every future internal pack for free, instead of one declared
+ *     slug at a time.
+ *
+ * WHY IT SURVIVES A REWORD. The marker below is not matched as a literal by two
+ * separate files. `markInternalOrigin()` writes it and `internalHostMetricsClass()`
+ * reads it, both from the single exported `INTERNAL_ORIGIN_MARKER` constant in
+ * this module — so changing the wording changes both sides in the same edit and
+ * cannot desynchronise them. The pack's own label (`fleet db error:`,
+ * `Pipeworx catalog error:`) is not read at all: reword it freely, the class is
+ * unaffected. That is the property `stripClassPrefix` lacked when it drifted
+ * from its own classifier three times and needed a CI gate to hold them
+ * together.
+ *
+ * WHERE THE 5xx TEST LIVES. `markInternalOrigin` is called from the places that
+ * hold the real `Response` — `httpError`/`httpErrorMessage` and the timeout
+ * branch of `fetchWithTimeout` in `shared/src/http.ts` — so "is this an
+ * availability failure" is decided from the actual status code, never re-derived
+ * by scraping a number out of a sentence. A 404 from our own registry for a slug
+ * that does not exist is a caller's bad argument and is deliberately NOT marked.
+ */
+
+/**
+ * OUR OWN web service was unreachable — not an upstream, and never `upstream_down`.
+ *
+ * ONE value, not three, unlike `internal_db_*`. That split existed because a
+ * slow query, an exhausted pool and an unknown SQLSTATE have different owners
+ * and different fixes. Here there is only one story to tell — an origin we run
+ * did not answer the edge — and one owner. A bucket with no distinct owner per
+ * value is decoration; #724 is what happens when a class holds several
+ * situations, and inventing sub-values ahead of a reason to act on them
+ * differently is the same mistake with the sign flipped.
+ *
+ * METRICS ONLY, exactly like PLATFORM_KEY_ERROR_CLASS and the internal_db
+ * values. `classifyToolError` still answers `upstream_down` for the retry and
+ * hint paths, which only care whether retrying or a sibling tool might work —
+ * and it might. Nothing a caller sees or is charged changes here.
+ *
+ * READ SIDE: this value is in BROKEN_TOOL_CLASSES, FAULT_CLASSES and
+ * ALL_ERROR_CLASSES in `workers/registry-api/src/index.ts`. All three, or it
+ * lands on no dashboard — fleet #721 is the warning, where the #719 split
+ * worked on the write side and was invisible for weeks.
+ */
+const INTERNAL_SERVICE_UNREACHABLE_CLASS = 'internal_service_unreachable';
+
+/**
+ * The token that carries "this origin is ours" from the call site to the
+ * classifier.
+ *
+ * Appended to the error message rather than attached to the Error object,
+ * because the object does not survive the trip: 275 packs return `{ error:
+ * string }` instead of throwing, the gateway reads `observedError` as a string,
+ * and the fleet pack rebuilds its error from a captured status + body across a
+ * retry loop. A property on an Error would be dropped by every one of those
+ * paths and the class would work in tests and vanish in production.
+ *
+ * WORDING IS LOAD-BEARING, same rule as labelAge's note in authority.ts. This
+ * string is appended to a pack's thrown Error message (shared/src/http.ts),
+ * and a thrown Error's message is exactly what the gateway hands back to the
+ * caller as `content[0].text` when nothing rewrites it (workers/gateway/src
+ * catches the throw and sets `rawResult.message = stripClassPrefix(error)`,
+ * which does not touch this suffix) — so the original wording,
+ * " [pipeworx-hosted origin — our own service, not a third party]", was not a
+ * theoretical leak: it shipped live on pipeworx-catalog's 522s, 7 times in 6
+ * hours on 2026-09-02 (see tests/golden-internal-service.test.ts), verbatim
+ * naming Pipeworx as the host. check:hosting-claims never caught it because it
+ * did not scan shared/ at all (task #2009). Reworded to describe the
+ * OBSERVATION (the origin did not answer) without a claim about who runs it —
+ * the identical fix labelAge got: drop the possessive, keep the fact.
+ */
+const INTERNAL_ORIGIN_MARKER = ' [origin did not respond — retry before concluding the named source is down]';
+
+/**
+ * Supabase's data plane for a project is `<ref>.supabase.co`, where the ref is
+ * exactly twenty lowercase letters (ours is `pqauisounztsgdgfkhke`).
+ *
+ * Matching the shape rather than listing the ref keeps this correct when we add
+ * a project — `supabaseEnv` on a pack entry already points some packs at a
+ * second one — while still excluding `status.supabase.co`, which is Supabase's
+ * own status page and emphatically not our database. Verified 2026-09-02 by
+ * `grep -rhoE '[a-z0-9-]+\.supabase\.(co|in)' mcps shared workers scripts`: the
+ * only real project ref anywhere in the tree is ours, the rest are doc
+ * placeholders (`abc`, `xyz`, `example`) which this pattern also excludes. Same
+ * finding internal-db-class.ts relies on for the PostgREST envelope being ours
+ * by construction.
+ */
+const SUPABASE_PROJECT_HOST = /^[a-z]{20}\.supabase\.(co|in)$/;
+
+/**
+ * Is this a host WE run?
+ *
+ * Deliberately NOT including `*.workers.dev`: plenty of third-party APIs are
+ * hosted on workers.dev, so the suffix says where something runs and not who
+ * owns it. Every internal call we actually make goes to a `pipeworx.io`
+ * hostname or to our Supabase project, both of which are ownership facts.
+ *
+ * `workers/gateway/src/provenance.ts`'s `OUR_HOSTS` answers the same
+ * question and DOES include `workers.dev` — a documented divergence
+ * (task #2051), not a bug to converge. That list decides what a response may
+ * cite as a data SOURCE, where a false negative (citing our own worker as an
+ * external source) is the hosting-disclosure leak this whole file exists to
+ * prevent, so it errs broad. This one decides who gets BLAMED for a 5xx in
+ * outage metrics read by on-call, where a false positive (crediting our own
+ * infra with a third party's outage) hides the real failure, so it errs
+ * narrow. Same suffix, opposite direction, because they are never called for
+ * the same reason.
+ *
+ * Returns false on anything unparseable rather than throwing — this runs inside
+ * an error path, and an error path that can itself throw turns a diagnosable
+ * failure into a mystery.
+ */
+function isPipeworxOrigin(url: string | URL | undefined | null): boolean {
+  if (!url) return false;
+  let host: string;
+  try {
+    host = new URL(url instanceof URL ? url.href : url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === 'pipeworx.io' || host.endsWith('.pipeworx.io')) return true;
+  return SUPABASE_PROJECT_HOST.test(host);
+}
+
+/**
+ * Append the marker when this failure was OUR origin failing to answer.
+ *
+ * `status` is the HTTP status when there is one, and omitted for a timeout —
+ * where there is no response at all, and "the origin did not answer" is the
+ * whole observation. Statuses below 500 are left alone: a 404 from our own
+ * registry for a slug that does not exist is the caller's argument, not our
+ * outage, and marking it would put ordinary 404s on the incident dashboard.
+ *
+ * Idempotent, so a message that is wrapped and re-marked on the way up (the
+ * fleet pack's retry loop re-throws through two layers) carries the marker once.
+ */
+function markInternalOrigin(
+  message: string,
+  url: string | URL | undefined | null,
+  status?: number,
+): string {
+  if (status !== undefined && status < 500) return message;
+  if (!isPipeworxOrigin(url)) return message;
+  if (message.includes(INTERNAL_ORIGIN_MARKER)) return message;
+  return message + INTERNAL_ORIGIN_MARKER;
+}
+
+/**
+ * Which blob4 value a failure from our own web services books as, or undefined
+ * if this is not one.
+ *
+ * Ordered AFTER `internalDbMetricsClass` at the call site: a PostgREST envelope
+ * from our own Supabase is a strictly more specific statement about the same
+ * row (which of our services, and why), and the two cannot disagree about
+ * whether the failure is ours.
+ */
+function internalHostMetricsClass(error: string): string | undefined {
+  return error.includes(INTERNAL_ORIGIN_MARKER) ? INTERNAL_SERVICE_UNREACHABLE_CLASS : undefined;
+}
+/**
  * Chronicling America MCP — full-text search of ~150 years of digitized U.S.
  * newspapers (1690s–present) from the Library of Congress.
  *
@@ -34,6 +316,33 @@ interface McpToolExport {
  *
  * Complements the `trove` pack (Australian historic newspapers) with the U.S.
  * corpus. Tool: search_newspapers.
+ *
+ * STUCK AT 100% FOR 7 DAYS (fleet #2708, reproduced live 2026-10-06). LoC's
+ * chronicling-america SEARCH backend (any request carrying `q=`, whether JSON
+ * or HTML, via loc.gov directly or via the egress relay below) now either
+ * 403s fast or hangs with literally zero bytes back until our own timeout —
+ * reproduced from a vantage with no Pipeworx infra in the path at all, so this
+ * is LoC-side (a bot/WAF rule on search specifically), not us. Browsing the
+ * same collection WITHOUT a search term (`fo=json` alone) still returns 200,
+ * so it is not a site-wide outage. There is no working alternate path: the
+ * legacy chroniclingamerica.loc.gov host 308-redirects back to this same
+ * endpoint, and /search/?fa=partof:chronicling+america 302s back to it too.
+ * Nothing here can route around a block LoC is applying to search queries;
+ * see the fleet #2708 close note for the full reproduction evidence.
+ *
+ * MISCLASSIFICATION THIS FIXES: the stuck-class check saw failures whose
+ * recorded `sources` host was pqauisounztsgdgfkhke.supabase.co (our Supabase
+ * project) and read that as "our own Postgres is 500ing" — this pack holds no
+ * database table and runs no query at all. That host is only the egress
+ * RELAY's own URL (locFetch below routes through it when the gateway injects
+ * _proxyUrl/_proxyToken, because loc.gov 403s CF egress on every UA);
+ * `workers/gateway/src/upstream-capture.ts` records the
+ * literal fetch target by design, so any relay-routed pack's failure always
+ * shows the relay's host, never the real upstream. The genuine ownership
+ * split that matters is handled below: a failure that never reached LoC at
+ * all (the relay's own synthesized 400/401/403/405 — a dead token, a host
+ * dropped from its allow-list) is marked ours via markInternalOrigin; a
+ * response or hang that did reach loc.gov, however LoC answered, stays theirs.
  */
 
 
@@ -109,6 +418,17 @@ async function locFetch(target: string, args: Record<string, unknown>, signal: A
   return fetch(target, { headers: { Accept: 'application/json', 'User-Agent': UA }, signal });
 }
 
+// supabase/functions/egress-proxy/index.ts synthesizes exactly these {error}
+// bodies for a request that never reached loc.gov at all — a dead/missing
+// bearer token, a host the relay's allow-list dropped, a malformed target URL.
+// Every one of those is OUR configuration, not Library of Congress refusing
+// us, and must book as our own outage (fleet #1096's internal-host fix) or a
+// dead relay token reads as "LoC is down" forever. `upstream_fetch_failed`
+// (502) is deliberately excluded: that is the relay's own fetch to LoC
+// failing at the network level, which is a statement about LoC's reachability
+// from the relay's egress, not about our side of the hop.
+const RELAY_SELF_ERRORS = new Set(['unauthorized', 'bad_request', 'bad_url', 'host_not_allowed', 'method_not_allowed']);
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   if (name !== 'search_newspapers') throw new Error(`Unknown tool: ${name}`);
 
@@ -127,6 +447,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const state = (args.state as string | undefined)?.trim().toLowerCase();
   if (state) p.set('fa', `location_state:${state}`);
 
+  const proxyUrl = (args._proxyUrl as string | undefined)?.trim();
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 15000);
   let res: Response;
@@ -134,12 +455,39 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     res = await locFetch(`${BASE}?${p}`, args, controller.signal);
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') throw new Error('upstream_down: Library of Congress did not respond within 15s.');
-    throw e;
+    // A network-level failure here (DNS, TLS, connection refused) means the
+    // fetch never got an HTTP response from ANYONE — when a relay is in play
+    // that is our own relay unreachable, not LoC. markInternalOrigin no-ops
+    // when proxyUrl is undefined (direct-fetch path, isPipeworxOrigin rejects
+    // www.loc.gov), so the direct path keeps its own upstream_down: prefix.
+    // `detail` is a fetch()-level failure, never ours, but it is embedded as a
+    // FRAGMENT below (never at position 0) — dropClassPrefix() inline, in
+    // EACH branch, strips any token it might coincidentally start with and
+    // lets the outer message declare the real class, per check:class-prefix.
+    const detail = (e as Error)?.message ?? String(e);
+    if (proxyUrl) {
+      throw new Error(markInternalOrigin(`chronicling-america egress relay unreachable: ${dropClassPrefix(detail)}`, proxyUrl));
+    }
+    throw new Error(`upstream_down: Library of Congress unreachable: ${dropClassPrefix(detail)}`);
   } finally {
     clearTimeout(t);
   }
+
+  if (!res.ok && proxyUrl) {
+    // Sniff for the relay's OWN synthesized error envelope before trusting
+    // `res.status` as LoC's status — see RELAY_SELF_ERRORS above.
+    let relayBody: { error?: unknown } = {};
+    try { relayBody = (await res.clone().json()) as { error?: unknown }; } catch { /* not JSON => a forwarded LoC response */ }
+    if (typeof relayBody.error === 'string' && RELAY_SELF_ERRORS.has(relayBody.error)) {
+      throw new Error(markInternalOrigin(`chronicling-america egress relay error: ${relayBody.error}`, proxyUrl, 500));
+    }
+  }
   if (!res.ok) {
-    const prefix = res.status >= 500 ? 'upstream_down: ' : '';
+    // 403/429 from LoC itself is access-denial/rate-limit shaped — classify it
+    // explicitly rather than relying on `\b403\b` happening to appear in the
+    // message text (classifyToolError's generic wording rule). 5xx and the
+    // timeout above are the only other case LoC itself produces.
+    const prefix = res.status >= 500 ? 'upstream_down: ' : res.status === 403 || res.status === 429 ? 'upstream_throttled: ' : '';
     throw new Error(`${prefix}Library of Congress error: HTTP ${res.status}`);
   }
 
