@@ -317,18 +317,26 @@ function internalHostMetricsClass(error: string): string | undefined {
  * Complements the `trove` pack (Australian historic newspapers) with the U.S.
  * corpus. Tool: search_newspapers.
  *
- * STUCK AT 100% FOR 7 DAYS (fleet #2708, reproduced live 2026-10-06). LoC's
- * chronicling-america SEARCH backend (any request carrying `q=`, whether JSON
- * or HTML, via loc.gov directly or via the egress relay below) now either
- * 403s fast or hangs with literally zero bytes back until our own timeout —
- * reproduced from a vantage with no Pipeworx infra in the path at all, so this
- * is LoC-side (a bot/WAF rule on search specifically), not us. Browsing the
- * same collection WITHOUT a search term (`fo=json` alone) still returns 200,
- * so it is not a site-wide outage. There is no working alternate path: the
- * legacy chroniclingamerica.loc.gov host 308-redirects back to this same
- * endpoint, and /search/?fa=partof:chronicling+america 302s back to it too.
- * Nothing here can route around a block LoC is applying to search queries;
- * see the fleet #2708 close note for the full reproduction evidence.
+ * SEARCH IS NOT DEAD, IT IS A LOTTERY (fleet #2708 called it 100% dead on
+ * 2026-10-06; reproduced live again 2026-10-17 for fleet #3246 and it is not
+ * — it is a bot/WAF rule that lets a small, roughly constant fraction of `q=`
+ * requests through and either 403s fast or hangs with zero bytes back on the
+ * rest). 30-day Analytics Engine numbers for this pack: 8 success / 137 calls
+ * (5.8%), close to the 8.3% fleet #3246 was filed against. A live sample of 10
+ * single-shot FRESH (uncached) queries during the #3246 fix reproduced exactly
+ * that shape: 1 success, 9 timeouts. Browsing the same collection WITHOUT a
+ * search term (`fo=json` alone) still returns 200 every time, so it is not a
+ * site-wide outage, and there is no working alternate endpoint: the legacy
+ * chroniclingamerica.loc.gov host redirects to a path that 404s, and
+ * /search/?fa=partof:chronicling+america 302s straight back to this same
+ * collections/chronicling-america endpoint. So the only lever available is
+ * trying more than once per call — see `MAX_ATTEMPTS` below — which is
+ * grounded in a real observation, not a hope: during the #3246 reproduction,
+ * a query that timed out on attempt 1 (15s, zero bytes) came back with 707
+ * real matches on attempt 2, fired immediately after with no deliberate delay.
+ * Each attempt is independent against the same WAF, so retrying trades wall
+ * time for a materially better cumulative hit rate (roughly 1-(1-p)^n for a
+ * per-attempt rate p of ~6-10%) without touching anything LoC-side.
  *
  * MISCLASSIFICATION THIS FIXES: the stuck-class check saw failures whose
  * recorded `sources` host was pqauisounztsgdgfkhke.supabase.co (our Supabase
@@ -429,6 +437,93 @@ async function locFetch(target: string, args: Record<string, unknown>, signal: A
 // from the relay's egress, not about our side of the hop.
 const RELAY_SELF_ERRORS = new Set(['unauthorized', 'bad_request', 'bad_url', 'host_not_allowed', 'method_not_allowed']);
 
+// Fleet #3246: LoC's search WAF is a lottery, not a wall (see the file header).
+// Retrying a few times against the SAME endpoint recovers real answers that a
+// single-shot call would have reported as `upstream_down`/`upstream_throttled`.
+// Bounded well under the gateway's 75s default tools/call budget
+// (`workers/gateway/src/request-budget.ts`) even in the worst case: 4 attempts
+// x 10s + backoff is ~41s, leaving over 30s of margin.
+const MAX_ATTEMPTS = 4;
+const ATTEMPT_TIMEOUT_MS = 10_000;
+const RETRY_BACKOFF_BASE_MS = 300;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Thrown by a single attempt; `retryable` says whether another attempt is worth making. */
+class LocAttemptError extends Error {
+  retryable: boolean;
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.retryable = retryable;
+  }
+}
+
+// One attempt against the LoC endpoint: fetch, classify the outcome, and
+// either return the parsed body or throw a LocAttemptError carrying whether
+// trying again has any chance of doing better. All error-message conventions
+// (upstream_down:/upstream_throttled: prefixes, markInternalOrigin,
+// dropClassPrefix on embedded fragments) are unchanged from the single-shot
+// version this replaces — only the retry/no-retry decision is new.
+async function attemptOnce(
+  target: string,
+  args: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<{ results?: LocResult[]; pagination?: { of?: number } }> {
+  const proxyUrl = (args._proxyUrl as string | undefined)?.trim();
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await locFetch(target, args, controller.signal);
+  } catch (e) {
+    if ((e as Error)?.name === 'AbortError') {
+      throw new LocAttemptError(`upstream_down: Library of Congress did not respond within ${Math.round(timeoutMs / 1000)}s.`, true);
+    }
+    // A network-level failure here (DNS, TLS, connection refused) means the
+    // fetch never got an HTTP response from ANYONE — when a relay is in play
+    // that is our own relay unreachable, not LoC. markInternalOrigin no-ops
+    // when proxyUrl is undefined (direct-fetch path, isPipeworxOrigin rejects
+    // www.loc.gov), so the direct path keeps its own upstream_down: prefix.
+    // `detail` is a fetch()-level failure, never ours, but it is embedded as a
+    // FRAGMENT below (never at position 0) — dropClassPrefix() inline, in
+    // EACH branch, strips any token it might coincidentally start with and
+    // lets the outer message declare the real class, per check:class-prefix.
+    const detail = (e as Error)?.message ?? String(e);
+    if (proxyUrl) {
+      throw new LocAttemptError(markInternalOrigin(`chronicling-america egress relay unreachable: ${dropClassPrefix(detail)}`, proxyUrl), true);
+    }
+    throw new LocAttemptError(`upstream_down: Library of Congress unreachable: ${dropClassPrefix(detail)}`, true);
+  } finally {
+    clearTimeout(t);
+  }
+
+  if (!res.ok && proxyUrl) {
+    // Sniff for the relay's OWN synthesized error envelope before trusting
+    // `res.status` as LoC's status — see RELAY_SELF_ERRORS above. This is our
+    // own misconfiguration (a dead token, a dropped host), not LoC's WAF
+    // lottery, so it is never worth retrying.
+    let relayBody: { error?: unknown } = {};
+    try { relayBody = (await res.clone().json()) as { error?: unknown }; } catch { /* not JSON => a forwarded LoC response */ }
+    if (typeof relayBody.error === 'string' && RELAY_SELF_ERRORS.has(relayBody.error)) {
+      throw new LocAttemptError(markInternalOrigin(`chronicling-america egress relay error: ${relayBody.error}`, proxyUrl, 500), false);
+    }
+  }
+  if (!res.ok) {
+    // 403/429 from LoC itself is access-denial/rate-limit shaped — classify it
+    // explicitly rather than relying on `\b403\b` happening to appear in the
+    // message text (classifyToolError's generic wording rule). 5xx and the
+    // timeout above are the only other case LoC itself produces, and all three
+    // are exactly the WAF-lottery shape worth retrying.
+    const retryable = res.status >= 500 || res.status === 403 || res.status === 429;
+    const prefix = res.status >= 500 ? 'upstream_down: ' : res.status === 403 || res.status === 429 ? 'upstream_throttled: ' : '';
+    throw new LocAttemptError(`${prefix}Library of Congress error: HTTP ${res.status}`, retryable);
+  }
+
+  return (await res.json()) as { results?: LocResult[]; pagination?: { of?: number } };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   if (name !== 'search_newspapers') throw new Error(`Unknown tool: ${name}`);
 
@@ -447,51 +542,32 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const state = (args.state as string | undefined)?.trim().toLowerCase();
   if (state) p.set('fa', `location_state:${state}`);
 
-  const proxyUrl = (args._proxyUrl as string | undefined)?.trim();
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 15000);
-  let res: Response;
-  try {
-    res = await locFetch(`${BASE}?${p}`, args, controller.signal);
-  } catch (e) {
-    if ((e as Error)?.name === 'AbortError') throw new Error('upstream_down: Library of Congress did not respond within 15s.');
-    // A network-level failure here (DNS, TLS, connection refused) means the
-    // fetch never got an HTTP response from ANYONE — when a relay is in play
-    // that is our own relay unreachable, not LoC. markInternalOrigin no-ops
-    // when proxyUrl is undefined (direct-fetch path, isPipeworxOrigin rejects
-    // www.loc.gov), so the direct path keeps its own upstream_down: prefix.
-    // `detail` is a fetch()-level failure, never ours, but it is embedded as a
-    // FRAGMENT below (never at position 0) — dropClassPrefix() inline, in
-    // EACH branch, strips any token it might coincidentally start with and
-    // lets the outer message declare the real class, per check:class-prefix.
-    const detail = (e as Error)?.message ?? String(e);
-    if (proxyUrl) {
-      throw new Error(markInternalOrigin(`chronicling-america egress relay unreachable: ${dropClassPrefix(detail)}`, proxyUrl));
-    }
-    throw new Error(`upstream_down: Library of Congress unreachable: ${dropClassPrefix(detail)}`);
-  } finally {
-    clearTimeout(t);
-  }
-
-  if (!res.ok && proxyUrl) {
-    // Sniff for the relay's OWN synthesized error envelope before trusting
-    // `res.status` as LoC's status — see RELAY_SELF_ERRORS above.
-    let relayBody: { error?: unknown } = {};
-    try { relayBody = (await res.clone().json()) as { error?: unknown }; } catch { /* not JSON => a forwarded LoC response */ }
-    if (typeof relayBody.error === 'string' && RELAY_SELF_ERRORS.has(relayBody.error)) {
-      throw new Error(markInternalOrigin(`chronicling-america egress relay error: ${relayBody.error}`, proxyUrl, 500));
+  const target = `${BASE}?${p}`;
+  let data: { results?: LocResult[]; pagination?: { of?: number } } | undefined;
+  let lastErr: Error = new Error('search_newspapers: no attempt ran');
+  let attemptsTried = 0;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    attemptsTried = attempt;
+    try {
+      data = await attemptOnce(target, args, ATTEMPT_TIMEOUT_MS);
+      lastErr = undefined as unknown as Error;
+      break;
+    } catch (e) {
+      lastErr = e as Error;
+      const retryable = e instanceof LocAttemptError ? e.retryable : false;
+      if (!retryable || attempt === MAX_ATTEMPTS) break;
+      await sleep(RETRY_BACKOFF_BASE_MS * attempt + Math.floor(Math.random() * 200));
     }
   }
-  if (!res.ok) {
-    // 403/429 from LoC itself is access-denial/rate-limit shaped — classify it
-    // explicitly rather than relying on `\b403\b` happening to appear in the
-    // message text (classifyToolError's generic wording rule). 5xx and the
-    // timeout above are the only other case LoC itself produces.
-    const prefix = res.status >= 500 ? 'upstream_down: ' : res.status === 403 || res.status === 429 ? 'upstream_throttled: ' : '';
-    throw new Error(`${prefix}Library of Congress error: HTTP ${res.status}`);
+  if (!data) {
+    // Preserve the final attempt's class prefix (position 0) exactly; the
+    // attempt count actually made is appended as a trailing fragment, never
+    // prepended, so check:class-prefix still sees one classifier token at the
+    // start — and a non-retryable failure truthfully says "tried 1 time"
+    // rather than claiming retries that never happened.
+    throw new Error(`${lastErr.message}${attemptsTried > 1 ? ` (tried ${attemptsTried} times)` : ''}`);
   }
 
-  const data = (await res.json()) as { results?: LocResult[]; pagination?: { of?: number } };
   const results = (data.results ?? []).map((r) => ({
     newspaper: cleanNewspaper(r.title),
     date: r.date ?? null,
@@ -504,9 +580,12 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 
   return {
     query,
+    filters_tried: { query, date_from: fromY ?? null, date_to: toY ?? null, state: state ?? null },
     total_matches: data.pagination?.of ?? null,
     returned: results.length,
-    note: 'Historical U.S. newspaper pages from the Library of Congress (Chronicling America). page_url opens the digitized page on loc.gov; page_image is the scanned-page image.',
+    note: results.length === 0
+      ? 'No matching newspaper pages for these filters (query/date range/state). Try a broader date range or drop the state filter.'
+      : 'Historical U.S. newspaper pages from the Library of Congress (Chronicling America). page_url opens the digitized page on loc.gov; page_image is the scanned-page image.',
     results,
   };
 }
