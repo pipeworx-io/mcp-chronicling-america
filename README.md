@@ -1,14 +1,42 @@
-# mcp-chronicling-america
+# @pipeworx/chronicling-america
 
-Chronicling America MCP — full-text search of ~150 years of digitized U.S. newspapers (1690s–present) from the Library of Congress.
+Full-text search of digitized historical U.S. newspapers from the Library of
+Congress's Chronicling America collection — the newspaper, date, place, page
+link and an excerpt of the page's OCR text for any person, event or topic.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1837+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `search_newspapers` | Full-text search of digitized historical U.S. newspapers (~1690s–present) from the Library of Congress "Chronicling America" collection. Find primary-source newspaper coverage of any person, event, place, or topic in history — returns the newspaper, publication date, city/state, a link to the digitized page, and the page-scan image URL. Filter by date range and U.S. state. Example: search_newspapers({ query: "influenza epidemic", date_from: "1918", date_to: "1919", state: "oklahoma" }). |
+- `search_newspapers({ query, state?, date_from?, date_to?, limit? })` — pages
+  whose OCR text matches `query`, ranked by relevance, `total_matches` first.
+  Filter by U.S. state (name or postal code) and by year or exact date.
+  Every response carries `data_as_of` and `served_from`:
+  - `pipeworx_search` — states in Pipeworx search coverage (today: Montana,
+    every page from its National Digital Newspaper Program batches). Answers
+    in about a second with an `excerpt` of each matching page and a
+    `coverage` block saying exactly which pages and years are searched.
+  - `loc_search` — everything else goes to the Library of Congress search,
+    retried a few times because it answers only a fraction of requests. A
+    failure there is reported as `upstream_down`, never as "no matches".
+
+## Auth
+
+Keyless.
+
+## Data sources
+
+- Library of Congress, Chronicling America (National Digital Newspaper
+  Program) — page OCR text and newspaper title records. US public domain.
+
+Notes for the next person:
+
+- The Library of Congress keyword search is the unreliable part: on
+  2026-10-18 a fresh keyword query timed out from every network we tried,
+  about 9 times in 10.
+- Results from `pipeworx_search` link to the same loc.gov page viewer
+  (`page_url`) as the LoC search does; `excerpt` is the page's raw OCR, which
+  is noisy for 19th- and early-20th-century type.
 
 ## Quick Start
 
@@ -54,7 +82,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1831+ data sources. The
+Both URLs reach the same gateway and the same 1837+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -63,7 +91,7 @@ reaches all of them from either one.
 ```bash
 curl -X POST https://gateway.pipeworx.io/v1/tools/search_newspapers \
   -H 'Content-Type: application/json' \
-  -d '{"query":"influenza epidemic","date_from":"1918","date_to":"1919","state":"oklahoma"}'
+  -d '{"query":"flood","state":"montana","date_from":"1922","date_to":"1922"}'
 ```
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/search_newspapers`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.

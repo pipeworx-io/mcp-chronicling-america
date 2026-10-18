@@ -353,6 +353,7 @@ function internalHostMetricsClass(error: string): string | undefined {
  * response or hang that did reach loc.gov, however LoC answered, stays theirs.
  */
 
+import { LocalStoreError, normalizeState, pickSlice, searchLocal, SOURCE } from './local.js';
 
 const BASE = 'https://www.loc.gov/collections/chronicling-america/';
 const UA = 'pipeworx-mcp/1.0 (+https://pipeworx.io)';
@@ -361,14 +362,14 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'search_newspapers',
     description:
-      'Full-text search of digitized historical U.S. newspapers (~1690s–present) from the Library of Congress "Chronicling America" collection. Find primary-source newspaper coverage of any person, event, place, or topic in history — returns the newspaper, publication date, city/state, a link to the digitized page, and the page-scan image URL. Filter by date range and U.S. state. Example: search_newspapers({ query: "influenza epidemic", date_from: "1918", date_to: "1919", state: "oklahoma" }).',
+      'Full-text search of digitized historical U.S. newspapers (~1690s–present) from the Library of Congress "Chronicling America" collection. Find primary-source newspaper coverage of any person, event, place, or topic in history — returns the total match count, then for each page the newspaper, publication date, city/state and a link to the digitized page (plus an OCR text excerpt of the matching page for covered states such as Montana). Filter by date range and U.S. state; every response carries data_as_of. Example: search_newspapers({ query: "influenza epidemic", date_from: "1918", date_to: "1919", state: "oklahoma" }).',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Full-text search terms (matched against the OCR\'d newspaper text).' },
         date_from: { type: 'string', description: 'Earliest year or date (e.g. "1918" or "1918-01-01"). Defaults to the collection start.' },
         date_to: { type: 'string', description: 'Latest year or date (e.g. "1919"). Defaults to present.' },
-        state: { type: 'string', description: 'U.S. state name to restrict to (lowercase, e.g. "california", "new york").' },
+        state: { type: 'string', description: 'U.S. state to restrict to: name or postal code (e.g. "california", "new york", "MT").' },
         limit: { type: 'number', description: 'Number of results (default 10, max 25).' },
       },
       required: ['query'],
@@ -386,6 +387,12 @@ interface LocResult {
   location_state?: string[] | string;
   language?: string[] | string;
   description?: string[] | string;
+}
+
+/** "1922-03-09" stays a day bound; a bare year is a year bound and yields null here. */
+function fullDate(v: unknown): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v ?? '').trim());
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
 }
 
 function first(v: string[] | string | undefined): string | null {
@@ -539,8 +546,42 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const toY = year(args.date_to as string | undefined);
   if (fromY || toY) p.set('dates', `${fromY ?? '1690'}/${toY ?? '2030'}`);
 
-  const state = (args.state as string | undefined)?.trim().toLowerCase();
+  const state = normalizeState(args.state as string | undefined);
   if (state) p.set('fa', `location_state:${state}`);
+
+  // Fleet #3246: a state inside Pipeworx search coverage is answered there
+  // (local.ts); LoC's own keyword search (below) answers everything else. An
+  // infrastructure failure falls through to the LoC search and says so — it
+  // is never reported as "no matching pages".
+  let localError: string | null = null;
+  const picked = await pickSlice(args, state, fromY ? Number(fromY) : null, toY ? Number(toY) : null);
+  if (picked) {
+    try {
+      const local = await searchLocal(args, picked, {
+        query, limit,
+        fromY: fromY ? Number(fromY) : null, toY: toY ? Number(toY) : null,
+        fromDate: fullDate(args.date_from), toDate: fullDate(args.date_to),
+      });
+      const filters_tried = { query, date_from: fromY ?? null, date_to: toY ?? null, state: state ?? null };
+      return {
+        query,
+        filters_tried,
+        total_matches: local.total_matches,
+        returned: local.returned,
+        served_from: local.served_from,
+        match_mode: local.match_mode,
+        data_as_of: local.data_as_of,
+        source: SOURCE,
+        coverage: local.coverage,
+        note: local.returned === 0
+          ? `No ${state} newspaper pages match ${JSON.stringify(filters_tried)}. Coverage is ${JSON.stringify(local.coverage.years)}; try other words (OCR text is noisy, so a common synonym often matches) or widen the date range.`
+          : `Pages from digitized ${state} newspapers held by the Library of Congress (Chronicling America), ranked by relevance. page_url opens the page on loc.gov; excerpt is the page's OCR text around the first matching word.`,
+        results: local.results,
+      };
+    } catch (e) {
+      localError = e instanceof LocalStoreError ? e.message : `search error: ${dropClassPrefix(String((e as Error)?.message ?? e)).slice(0, 120)}`;
+    }
+  }
 
   const target = `${BASE}?${p}`;
   let data: { results?: LocResult[]; pagination?: { of?: number } } | undefined;
@@ -583,6 +624,10 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     filters_tried: { query, date_from: fromY ?? null, date_to: toY ?? null, state: state ?? null },
     total_matches: data.pagination?.of ?? null,
     returned: results.length,
+    served_from: 'loc_search',
+    data_as_of: new Date().toISOString().slice(0, 10),
+    source: SOURCE,
+    ...(localError ? { search_fallback: `Pipeworx search for this state was unavailable (${localError}); answered from the Library of Congress search instead.` } : {}),
     note: results.length === 0
       ? 'No matching newspaper pages for these filters (query/date range/state). Try a broader date range or drop the state filter.'
       : 'Historical U.S. newspaper pages from the Library of Congress (Chronicling America). page_url opens the digitized page on loc.gov; page_image is the scanned-page image.',
