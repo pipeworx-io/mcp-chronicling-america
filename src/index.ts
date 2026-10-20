@@ -353,7 +353,7 @@ function internalHostMetricsClass(error: string): string | undefined {
  * response or hang that did reach loc.gov, however LoC answered, stays theirs.
  */
 
-import { LocalStoreError, normalizeState, pickSlice, searchLocal, SOURCE } from './local.js';
+import { LocalStoreError, normalizeState, pickCoverage, searchLocal, SOURCE } from './local.js';
 
 const BASE = 'https://www.loc.gov/collections/chronicling-america/';
 const UA = 'pipeworx-mcp/1.0 (+https://pipeworx.io)';
@@ -549,12 +549,14 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   const state = normalizeState(args.state as string | undefined);
   if (state) p.set('fa', `location_state:${state}`);
 
-  // Fleet #3246: a state inside Pipeworx search coverage is answered there
-  // (local.ts); LoC's own keyword search (below) answers everything else. An
+  // Fleet #3246/#3334: a question inside Pipeworx search coverage (a state
+  // whose batches are all in, or a national question once every batch is) is
+  // answered there (local.ts); LoC's own keyword search (below) answers
+  // everything else. An
   // infrastructure failure falls through to the LoC search and says so — it
   // is never reported as "no matching pages".
   let localError: string | null = null;
-  const picked = await pickSlice(args, state, fromY ? Number(fromY) : null, toY ? Number(toY) : null);
+  const picked = await pickCoverage(args, state, fromY ? Number(fromY) : null, toY ? Number(toY) : null);
   if (picked) {
     try {
       const local = await searchLocal(args, picked, {
@@ -563,6 +565,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         fromDate: fullDate(args.date_from), toDate: fullDate(args.date_to),
       });
       const filters_tried = { query, date_from: fromY ?? null, date_to: toY ?? null, state: state ?? null };
+      const where = state ?? 'U.S.';
       return {
         query,
         filters_tried,
@@ -573,9 +576,11 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         data_as_of: local.data_as_of,
         source: SOURCE,
         coverage: local.coverage,
+        shards_searched: local.shards_searched,
+        shards_answered: local.shards_answered,
         note: local.returned === 0
-          ? `No ${state} newspaper pages match ${JSON.stringify(filters_tried)}. Coverage is ${JSON.stringify(local.coverage.years)}; try other words (OCR text is noisy, so a common synonym often matches) or widen the date range.`
-          : `Pages from digitized ${state} newspapers held by the Library of Congress (Chronicling America), ranked by relevance. page_url opens the page on loc.gov; excerpt is the page's OCR text around the first matching word.`,
+          ? `No ${where} newspaper pages match ${JSON.stringify(filters_tried)}. Coverage is ${JSON.stringify(local.coverage.years)}; try other words (OCR text is noisy, so a common synonym often matches) or widen the date range.`
+          : `Pages from digitized ${where} newspapers held by the Library of Congress (Chronicling America), ranked by relevance. page_url opens the page on loc.gov; excerpt is the page's OCR text around the first matching word.`,
         results: local.results,
       };
     } catch (e) {

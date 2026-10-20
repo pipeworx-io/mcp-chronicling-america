@@ -66,21 +66,41 @@ export function normalizeState(input: string | undefined): string | undefined {
   return POSTAL[s] ?? s;
 }
 
-// ── store shapes ──
+// ── shapes ──
 interface R2Obj { text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> }
-interface R2Like { get(key: string, opts?: { range?: { offset: number; length: number } }): Promise<R2Obj | null> }
+interface R2Like {
+  get(key: string, opts?: { range?: { offset: number; length: number } }): Promise<R2Obj | null>;
+  list?(opts: { prefix: string; limit?: number }): Promise<{ objects: { key: string }[] }>;
+}
 interface ShardStub { fetch: (url: string, init?: RequestInit) => Promise<Response> }
 interface ShardNs { idFromName(name: string): unknown; get(id: unknown): ShardStub }
 
+/** Pilot (fleet #3246) coverage entry: one awardee. Still read when no `coverage` block exists. */
 export interface SliceState {
   awardee: string; state: string | null; fips: string | null; shards: string[];
   year_min: number | null; year_max: number | null; pages_indexed: number; pages_listed: number;
   batches_applied: number; batches_listed: number; complete: boolean; data_as_of: string | null;
 }
-interface StateDoc { data_as_of: string | null; listing_checked_at?: string; slices: Record<string, SliceState> }
-interface TitleRow { idx: number; name: string | null; title_full?: string | null; city: string | null; state: string | null; parts: Record<string, string[]> }
+interface ShardInfo { states: Record<string, number>; year_min: number | null; year_max: number | null; pages?: number; documents?: number }
+interface CoverageEntry { complete: boolean; batches_total: number; batches_applied: number; shards?: string[]; year_min: number | null; year_max: number | null }
+interface StateDoc {
+  data_as_of: string | null; listing_checked_at?: string; slices?: Record<string, SliceState>;
+  coverage?: { national: CoverageEntry & { pages_listed?: number }; states: Record<string, CoverageEntry>; shards: Record<string, ShardInfo> };
+}
+interface TitleRow { idx: number; name: string | null; title_full?: string | null; city: string | null; state: string | null; states?: string[]; parts?: Record<string, string[]> }
 interface TitlesDoc { titles: Record<string, TitleRow> }
 interface PageIdx { idx: Record<string, [number, number]> }
+
+/** What one call will search: resolved from coverage, never hard-coded. */
+export interface Picked {
+  scope: string;                 // "montana" or "national"
+  fips: string | null;           // state filter token, null for national
+  shards: { name: string; year_min: number | null; year_max: number | null }[];
+  year_min: number; year_max: number;
+  pages: number | null;
+  batches: string;
+  data_as_of: string | null;
+}
 
 /** An infrastructure failure: the caller falls back to the LoC search rather than reporting "no matches". */
 export class LocalStoreError extends Error {}
@@ -107,24 +127,57 @@ function bindings(args: Record<string, unknown>): { r2: R2Like; ns: ShardNs } | 
   return { r2, ns };
 }
 
+function decadeOf(shard: string): number | null {
+  const m = /-(\d{4})$/.exec(shard);
+  return m ? Number(m[1]) : null;
+}
+
+const overlaps = (s: { year_min: number | null; year_max: number | null }, lo: number, hi: number) =>
+  s.year_min == null || s.year_max == null || (s.year_max >= lo && s.year_min <= hi);
+
 /**
- * Which coverage entry (if any) answers this call. Null means "use the LoC
- * search": no state filter, a state outside coverage, a date range entirely
- * outside its years, or a runtime without the gateway's bindings.
+ * What (if anything) Pipeworx search answers for this call. Null means "use
+ * the LoC search": a state whose batches are not all in yet, a national
+ * question before every batch is in, a date range outside coverage, or a
+ * runtime without the gateway's bindings. Coverage is read from the gateway at
+ * call time, so states start answering here as they complete.
  */
-export async function pickSlice(args: Record<string, unknown>, state: string | undefined, fromY: number | null, toY: number | null):
-  Promise<{ slice: SliceState; doc: StateDoc } | null> {
-  if (!state) return null;
+export async function pickCoverage(args: Record<string, unknown>, state: string | undefined, fromY: number | null, toY: number | null): Promise<Picked | null> {
   const b = bindings(args);
   if (!b) return null;
   let doc: StateDoc | null;
   try { doc = await readJson<StateDoc>(b.r2, `${PREFIX}/_state.json`); } catch { return null; }
-  if (!doc?.slices) return null;
-  const slice = Object.values(doc.slices).find((s) => s.state === state && s.pages_indexed > 0 && s.shards?.length);
-  if (!slice || slice.year_min == null || slice.year_max == null) return null;
+  if (!doc) return null;
   const lo = fromY ?? -Infinity, hi = toY ?? Infinity;
+
+  if (doc.coverage) {
+    const cov = doc.coverage;
+    const entry = state ? cov.states?.[state] : cov.national;
+    if (!entry?.complete || entry.year_min == null || entry.year_max == null) return null;
+    if (hi < entry.year_min || lo > entry.year_max) return null;
+    const names = state ? (entry.shards ?? []) : Object.keys(cov.shards ?? {});
+    const shards = names
+      .map((name) => ({ name, year_min: cov.shards[name]?.year_min ?? null, year_max: cov.shards[name]?.year_max ?? null, pages: cov.shards[name]?.documents ?? cov.shards[name]?.pages ?? 0 }))
+      .filter((x) => overlaps(x, lo, hi));
+    if (!shards.length) return null;
+    return {
+      scope: state ?? 'national',
+      fips: state ? STATE_FIPS[state] ?? null : null,
+      shards,
+      year_min: entry.year_min, year_max: entry.year_max,
+      pages: state ? shards.reduce((n, x) => n + (cov.shards[x.name]?.states?.[state] ?? 0), 0) || null : shards.reduce((n, x) => n + (x.pages ?? 0), 0) || null,
+      batches: `${entry.batches_applied} of ${entry.batches_total}`,
+      data_as_of: doc.data_as_of ?? null,
+    };
+  }
+
+  // Pilot format (before fleet #3334's first aggregate): one state, decade shards.
+  if (!state || !doc.slices) return null;
+  const slice = Object.values(doc.slices).find((x) => x.state === state && x.pages_indexed > 0 && x.shards?.length);
+  if (!slice || slice.year_min == null || slice.year_max == null) return null;
   if (hi < slice.year_min || lo > slice.year_max) return null;
-  return { slice, doc };
+  const shards = slice.shards.map((name) => { const d = decadeOf(name); return { name, year_min: d, year_max: d == null ? null : d + 9 }; }).filter((x) => overlaps(x, lo, hi));
+  return { scope: state, fips: slice.fips, shards, year_min: slice.year_min, year_max: slice.year_max, pages: slice.pages_indexed, batches: `${slice.batches_applied} of ${slice.batches_listed}`, data_as_of: slice.data_as_of ?? doc.data_as_of ?? null };
 }
 
 /** Split a caller's query into FTS5-safe quoted terms and phrases. */
@@ -151,10 +204,6 @@ export function buildMatch(terms: string[], mode: 'all' | 'any', fips: string | 
   return q;
 }
 
-function decadeOf(shard: string): number | null {
-  const m = /-(\d{4})$/.exec(shard);
-  return m ? Number(m[1]) : null;
-}
 
 async function gunzip(buf: ArrayBuffer): Promise<string> {
   const ds = new DecompressionStream('gzip');
@@ -179,7 +228,7 @@ function excerpt(text: string, terms: string[]): string {
 /** "The Helena independent (Helena, Mont.) 1875-1943" -> "The Helena independent (Helena, Mont.)" —
  *  the same shape the LoC search returns, so a caller sees one naming either way. */
 export function displayTitle(t: { name: string | null; title_full?: string | null } | undefined): string | null {
-  const full = t?.title_full?.replace(/\s+\d{4}-(?:[\d?]{1,4}|current)?\s*$/i, '').trim();
+  const full = t?.title_full?.replace(/\s+[\d?]{4}-(?:[\d?]{1,4}|current)?\s*$/i, '').trim();
   return full || t?.name || null;
 }
 
@@ -197,48 +246,92 @@ export interface LocalResult {
   results: Record<string, unknown>[];
 }
 
+/** National questions fan out to every shard; these bound what that costs. */
+const FANOUT_CONCURRENCY = 48;
+const FANOUT_DEADLINE_MS = 7_000;
+/** Exact totals need a full match count per shard; past this many shards it is skipped. */
+const COUNT_MAX_SHARDS = 12;
+
+async function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | 'timeout'> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<'timeout'>((r) => { t = setTimeout(() => r('timeout'), ms); });
+  try { return await Promise.race([p, timer]); } finally { if (t !== undefined) clearTimeout(t); }
+}
+
+async function pageText(r2: R2Like, lccn: string, t: TitleRow, date: string, edition: number, seq: number): Promise<string | null> {
+  const year = date.slice(0, 4);
+  const key = `${date.slice(5)}.${edition}.${seq}`;
+  const bases: string[] = [];
+  for (const batch of t.parts?.[year] ?? []) bases.push(`${PREFIX}/text/${batch}/${lccn}/${year}`);
+  if (!bases.length && typeof r2.list === 'function') {
+    const listed = await r2.list({ prefix: `${PREFIX}/t/${lccn}/${year}/`, limit: 50 });
+    for (const o of listed.objects) if (o.key.endsWith('.idx.json')) bases.push(o.key.slice(0, -'.idx.json'.length));
+  }
+  for (const base of bases) {
+    const idx = await readJson<PageIdx>(r2, `${base}.idx.json`).catch(() => null);
+    const loc = idx?.idx?.[key];
+    if (!loc) continue;
+    const obj = await r2.get(`${base}.bin`, { range: { offset: loc[0], length: loc[1] } });
+    if (obj) return await gunzip(await obj.arrayBuffer());
+  }
+  return null;
+}
+
 /** Throws LocalStoreError on any infrastructure failure (the caller falls back to the LoC search). */
 export async function searchLocal(
   args: Record<string, unknown>,
-  picked: { slice: SliceState; doc: StateDoc },
+  picked: Picked,
   q: { query: string; limit: number; fromY: number | null; toY: number | null; fromDate: string | null; toDate: string | null },
-): Promise<LocalResult> {
+): Promise<LocalResult & { shards_searched: number; shards_answered: number }> {
   const b = bindings(args);
   if (!b) throw new LocalStoreError('search bindings absent');
-  const { slice } = picked;
   const terms = queryTerms(q.query);
   if (!terms.length) throw new LocalStoreError('query has no searchable words');
-  const lo = Math.max(q.fromY ?? slice.year_min!, slice.year_min!);
-  const hi = Math.min(q.toY ?? slice.year_max!, slice.year_max!);
-  const wholeSpan = lo <= slice.year_min! && hi >= slice.year_max!;
+  const lo = Math.max(q.fromY ?? picked.year_min, picked.year_min);
+  const hi = Math.min(q.toY ?? picked.year_max, picked.year_max);
+  const wholeSpan = lo <= picked.year_min && hi >= picked.year_max;
   const years = wholeSpan ? null : Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
-  const shards = slice.shards.filter((s) => {
-    const d = decadeOf(s);
-    return d == null || (d + 9 >= lo && d <= hi);
-  });
+  const shards = picked.shards;
+  const count = shards.length <= COUNT_MAX_SHARDS;
   const want = Math.min(100, Math.max(q.limit * 3, 30));
+  const started = Date.now();
 
   const ask = async (mode: 'all' | 'any') => {
-    const match = buildMatch(terms, mode, slice.fips, years);
-    const outs = await Promise.all(shards.map(async (name) => {
-      const res = await b.ns.get(b.ns.idFromName(name)).fetch('https://shard/query', {
-        method: 'POST',
-        body: JSON.stringify({ q: match, limit: want, count: true }),
-        headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
-      });
-      if (!res.ok) throw new LocalStoreError(`search shard ${name} answered HTTP ${res.status}`);
-      return (await res.json()) as { total?: number; results?: { opinion_id: number; score: number }[] };
-    }));
+    const match = buildMatch(terms, mode, picked.fips, years);
+    const outs: ({ total?: number; results?: { opinion_id: number; score: number }[] } | null)[] = new Array(shards.length).fill(null);
+    let next = 0, failures = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= shards.length) return;
+        const left = FANOUT_DEADLINE_MS - (Date.now() - started);
+        if (left <= 0) return;
+        const r = await withDeadline((async () => {
+          const res = await b.ns.get(b.ns.idFromName(shards[i].name)).fetch('https://shard/query', {
+            method: 'POST',
+            body: JSON.stringify({ q: match, limit: want, count }),
+            headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
+          });
+          if (!res.ok) throw new LocalStoreError(`search shard ${shards[i].name} answered HTTP ${res.status}`);
+          return (await res.json()) as { total?: number; results?: { opinion_id: number; score: number }[] };
+        })().catch((e) => { failures++; if (shards.length === 1) throw e; return null; }), left);
+        if (r !== 'timeout') outs[i] = r;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(FANOUT_CONCURRENCY, shards.length) }, worker));
+    const answered = outs.filter((o): o is NonNullable<typeof o> => o != null);
+    if (!answered.length) throw new LocalStoreError(failures ? `no search shard answered (${failures} failed)` : 'no search shard answered in time');
     return {
-      // null, not 0, when a shard did not report a count: "not counted" must
-      // never read as "nothing matched" beside a list of matches.
-      total: outs.every((o) => typeof o.total === 'number') ? outs.reduce((n, o) => n + (o.total as number), 0) : null,
-      hits: outs.flatMap((o) => o.results ?? []).sort((x, y) => x.score - y.score),
+      answered: answered.length,
+      // null, not 0, when any shard did not report a count (not asked, not
+      // answered): "not counted" must never read as "nothing matched".
+      total: answered.length === shards.length && answered.every((o) => typeof o.total === 'number') ? answered.reduce((n, o) => n + (o.total as number), 0) : null,
+      hits: answered.flatMap((o) => o.results ?? []).sort((x, y) => x.score - y.score),
     };
   };
   let mode: 'all' | 'any' = 'all';
   let got = await ask('all');
-  if (!got.hits.length && terms.length > 1) { mode = 'any'; got = await ask('any'); }
+  if (!got.hits.length && terms.length > 1 && Date.now() - started < FANOUT_DEADLINE_MS / 2) { mode = 'any'; got = await ask('any'); }
 
   const titlesDoc = await readJson<TitlesDoc>(b.r2, `${PREFIX}/titles.json`);
   if (!titlesDoc) throw new LocalStoreError('title table unavailable');
@@ -247,30 +340,20 @@ export async function searchLocal(
 
   // Day-precision bounds are applied after retrieval (the index filters by year).
   const inDates = (d: string) => (!q.fromDate || d >= q.fromDate) && (!q.toDate || d <= q.toDate);
-  const picks = got.hits.map((h) => ({ h, p: decodeRowid(h.opinion_id) })).filter((x) => inDates(x.p.date)).slice(0, q.limit);
+  const seen = new Set<number>();
+  const picks = got.hits.filter((h) => !seen.has(h.opinion_id) && seen.add(h.opinion_id))
+    .map((h) => ({ h, p: decodeRowid(h.opinion_id) })).filter((x) => inDates(x.p.date)).slice(0, q.limit);
 
   const results = await Promise.all(picks.map(async ({ h, p }) => {
     const row = byIdx.get(p.titleIdx);
     const lccn = row?.[0] ?? null;
     const t = row?.[1];
-    let text: string | null = null;
-    if (lccn && t) {
-      const year = p.date.slice(0, 4);
-      const key = `${p.date.slice(5)}.${p.edition}.${p.seq}`;
-      for (const batch of t.parts?.[year] ?? []) {
-        const base = `${PREFIX}/text/${batch}/${lccn}/${year}`;
-        const idx = await readJson<PageIdx>(b.r2, `${base}.idx.json`).catch(() => null);
-        const loc = idx?.idx?.[key];
-        if (!loc) continue;
-        const obj = await b.r2.get(`${base}.bin`, { range: { offset: loc[0], length: loc[1] } });
-        if (obj) { text = await gunzip(await obj.arrayBuffer()); break; }
-      }
-    }
+    const text = lccn && t ? await pageText(b.r2, lccn, t, p.date, p.edition, p.seq).catch(() => null) : null;
     return {
       newspaper: displayTitle(t),
       date: p.date,
       city: t?.city ?? null,
-      state: t?.state ?? slice.state,
+      state: t?.states?.[0] ?? t?.state ?? (picked.scope === 'national' ? null : picked.scope),
       page: p.seq,
       edition: p.edition,
       lccn,
@@ -280,18 +363,23 @@ export async function searchLocal(
     };
   }));
 
+  const scopeName = picked.scope === 'national' ? 'every U.S. state and territory' : picked.scope[0].toUpperCase() + picked.scope.slice(1);
   return {
     served_from: 'pipeworx_search',
     total_matches: got.total,
     returned: results.length,
     match_mode: mode === 'all' ? 'all_terms' : 'any_term',
+    shards_searched: shards.length,
+    shards_answered: got.answered,
     coverage: {
-      what: `Every page in the Library of Congress's Chronicling America batches from the ${slice.state ? slice.state[0].toUpperCase() + slice.state.slice(1) : slice.awardee} NDNP awardee (${slice.awardee})`,
-      years: [slice.year_min, slice.year_max],
-      pages_searched: slice.pages_indexed,
-      batches: `${slice.batches_applied} of ${slice.batches_listed}`,
+      what: `Every digitized page the Library of Congress's Chronicling America holds for ${scopeName}`,
+      years: [picked.year_min, picked.year_max],
+      pages_searched: picked.pages,
+      batches: picked.batches,
+      ...(got.answered < shards.length ? { partial: `${got.answered} of ${shards.length} search partitions answered within the time limit; results come from those` } : {}),
+      ...(got.total === null && count === false ? { total_matches_note: 'not counted for questions spanning many partitions' } : {}),
     },
-    data_as_of: slice.data_as_of ?? picked.doc.data_as_of ?? null,
+    data_as_of: picked.data_as_of,
     results,
   };
 }

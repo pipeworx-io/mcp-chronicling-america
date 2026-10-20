@@ -4,7 +4,7 @@ Full-text search of digitized historical U.S. newspapers from the Library of
 Congress's Chronicling America collection — the newspaper, date, place, page
 link and an excerpt of the page's OCR text for any person, event or topic.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1837+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1854+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -12,10 +12,14 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
   whose OCR text matches `query`, ranked by relevance, `total_matches` first.
   Filter by U.S. state (name or postal code) and by year or exact date.
   Every response carries `data_as_of` and `served_from`:
-  - `pipeworx_search` — states in Pipeworx search coverage (today: Montana,
-    every page from its National Digital Newspaper Program batches). Answers
-    in about a second with an `excerpt` of each matching page and a
-    `coverage` block saying exactly which pages and years are searched.
+  - `pipeworx_search` — states in Pipeworx search coverage, and national
+    (no-state) questions once the whole collection is covered. Each answer
+    carries an `excerpt` of every matching page and a `coverage` block
+    (years, pages searched, batches). Coverage grows state by state: a state
+    answers here once every Library of Congress batch carrying its papers is
+    in. Montana is covered today; the rest of the collection is being added.
+    National answers are bounded at about seven seconds; if some partitions
+    have not answered by then, `coverage.partial` says how many did.
   - `loc_search` — everything else goes to the Library of Congress search,
     retried a few times because it answers only a fraction of requests. A
     failure there is reported as `upstream_down`, never as "no matches".
@@ -82,7 +86,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1837+ data sources. The
+Both URLs reach the same gateway and the same 1854+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
