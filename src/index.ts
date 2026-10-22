@@ -353,7 +353,7 @@ function internalHostMetricsClass(error: string): string | undefined {
  * response or hang that did reach loc.gov, however LoC answered, stays theirs.
  */
 
-import { LocalStoreError, normalizeState, pickCoverage, searchLocal, SOURCE } from './local.js';
+import { CALL_BUDGET_MS, LocalStoreError, normalizeState, pickCoverage, searchLocal, SOURCE } from './local.js';
 
 const BASE = 'https://www.loc.gov/collections/chronicling-america/';
 const UA = 'pipeworx-mcp/1.0 (+https://pipeworx.io)';
@@ -534,6 +534,7 @@ async function attemptOnce(
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   if (name !== 'search_newspapers') throw new Error(`Unknown tool: ${name}`);
 
+  const callStart = Date.now();
   const query = String(args.query ?? '').trim();
   if (!query) {
     throw new Error('Required argument "query" is missing. Pass search terms, e.g. search_newspapers({ query: "gold rush" }).');
@@ -578,7 +579,15 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         coverage: local.coverage,
         shards_searched: local.shards_searched,
         shards_answered: local.shards_answered,
-        note: local.returned === 0
+        // Explicit completeness (fleet #3334): rows from some partitions only are NOT the matches. A caller must
+        // be able to tell that from the payload without parsing prose.
+        complete: local.complete,
+        partitions_answered: local.shards_answered,
+        partitions_total: local.shards_searched,
+        ...(local.complete ? {} : { incomplete: true, missing_partitions: local.missing_partitions }),
+        note: !local.complete
+          ? `INCOMPLETE ANSWER: only ${local.shards_answered} of ${local.shards_searched} search partitions answered in time, so ${local.returned === 0 ? 'zero rows here does NOT mean no pages match, and ' : ''}the rows below (if any) are not the full set of matches and total_matches is withheld. Repeat the same call or narrow date_from/date_to.`
+          : local.returned === 0
           ? `No ${where} newspaper pages match ${JSON.stringify(filters_tried)}. Coverage is ${JSON.stringify(local.coverage.years)}; try other words (OCR text is noisy, so a common synonym often matches) or widen the date range.`
           : `Pages from digitized ${where} newspapers held by the Library of Congress (Chronicling America), ranked by relevance. page_url opens the page on loc.gov; excerpt is the page's OCR text around the first matching word.`,
         results: local.results,
@@ -593,9 +602,14 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   let lastErr: Error = new Error('search_newspapers: no attempt ran');
   let attemptsTried = 0;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // One wall budget for the whole call: a LoC leg is capped to what is left of it, and no new attempt starts
+    // once under 3s remain. 4 x 10s after a 7s local search was ~48s against a ~45s client, so the caller got
+    // nothing at all (Oklahoma/California, fleet #3334).
+    const left = CALL_BUDGET_MS - (Date.now() - callStart);
+    if (attempt > 1 && left < 3_000) break;
     attemptsTried = attempt;
     try {
-      data = await attemptOnce(target, args, ATTEMPT_TIMEOUT_MS);
+      data = await attemptOnce(target, args, Math.max(3_000, Math.min(ATTEMPT_TIMEOUT_MS, left)));
       lastErr = undefined as unknown as Error;
       break;
     } catch (e) {

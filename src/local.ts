@@ -23,6 +23,11 @@ export function encodeRowid(p: { titleIdx: number; date: string; edition: number
   return ((p.titleIdx * 131072 + day) * 8 + (p.edition - 1)) * 1024 + p.seq;
 }
 
+/** Day number as the rowid layout counts it; the shard filters on this (search-shard.ts). */
+export function dayNumber(date: string): number {
+  return Math.round((Date.parse(`${date}T00:00:00Z`) - DAY0) / 86_400_000);
+}
+
 export function decodeRowid(rowid: number): { titleIdx: number; date: string; edition: number; seq: number } {
   let r = rowid;
   const seq = r % 1024; r = Math.floor(r / 1024);
@@ -248,7 +253,10 @@ export interface LocalResult {
 
 /** National questions fan out to every shard; these bound what that costs. */
 const FANOUT_CONCURRENCY = 48;
-const FANOUT_DEADLINE_MS = 7_000;
+const FANOUT_DEADLINE_MS = 10_000;
+/** Wall budget for the whole call (local search plus any LoC fallback). The caller's own client gives up
+ *  around 45s; a fallback leg is only started if it can finish inside this, never beyond it. */
+export const CALL_BUDGET_MS = 26_000;
 /** Exact totals need a full match count per shard; past this many shards it is skipped. */
 const COUNT_MAX_SHARDS = 12;
 
@@ -282,7 +290,7 @@ export async function searchLocal(
   args: Record<string, unknown>,
   picked: Picked,
   q: { query: string; limit: number; fromY: number | null; toY: number | null; fromDate: string | null; toDate: string | null },
-): Promise<LocalResult & { shards_searched: number; shards_answered: number }> {
+): Promise<LocalResult & { shards_searched: number; shards_answered: number; complete: boolean; missing_partitions: string[] }> {
   const b = bindings(args);
   if (!b) throw new LocalStoreError('search bindings absent');
   const terms = queryTerms(q.query);
@@ -295,10 +303,17 @@ export async function searchLocal(
   const count = shards.length <= COUNT_MAX_SHARDS;
   const want = Math.min(100, Math.max(q.limit * 3, 30));
   const started = Date.now();
+  // Day-precision bounds go INTO the shard query (the year/month tokens only narrow to a year). Filtering
+  // after retrieval made total_matches count the whole year while the rows were cut to the requested days:
+  // "237 matches, 0 returned", and real in-range matches pushed out of the top 30 by out-of-range ones.
+  const dayMin = q.fromDate ? dayNumber(q.fromDate) : null;
+  const dayMax = q.toDate ? dayNumber(q.toDate) : null;
+  const dayFiltered = dayMin != null || dayMax != null;
 
   const ask = async (mode: 'all' | 'any') => {
     const match = buildMatch(terms, mode, picked.fips, years);
-    const outs: ({ total?: number; results?: { opinion_id: number; score: number }[] } | null)[] = new Array(shards.length).fill(null);
+    type ShardOut = { total?: number; day_filtered?: boolean; results?: { opinion_id: number; score: number }[] };
+    const outs: (ShardOut | null)[] = new Array(shards.length).fill(null);
     let next = 0, failures = 0;
     const worker = async () => {
       for (;;) {
@@ -309,11 +324,11 @@ export async function searchLocal(
         const r = await withDeadline((async () => {
           const res = await b.ns.get(b.ns.idFromName(shards[i].name)).fetch('https://shard/query', {
             method: 'POST',
-            body: JSON.stringify({ q: match, limit: want, count }),
+            body: JSON.stringify({ q: match, limit: want, count, ...(dayFiltered ? { day_min: dayMin, day_max: dayMax } : {}) }),
             headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
           });
           if (!res.ok) throw new LocalStoreError(`search shard ${shards[i].name} answered HTTP ${res.status}`);
-          return (await res.json()) as { total?: number; results?: { opinion_id: number; score: number }[] };
+          return (await res.json()) as ShardOut;
         })().catch((e) => { failures++; if (shards.length === 1) throw e; return null; }), left);
         if (r !== 'timeout') outs[i] = r;
       }
@@ -323,9 +338,12 @@ export async function searchLocal(
     if (!answered.length) throw new LocalStoreError(failures ? `no search shard answered (${failures} failed)` : 'no search shard answered in time');
     return {
       answered: answered.length,
+      missing: shards.filter((_, i) => outs[i] == null).map((x) => x.name),
+      // A shard that predates the day filter ignores it and counts the whole year; its total is not ours to report.
+      dayFilterHeld: !dayFiltered || answered.every((o) => o.day_filtered === true),
       // null, not 0, when any shard did not report a count (not asked, not
       // answered): "not counted" must never read as "nothing matched".
-      total: answered.length === shards.length && answered.every((o) => typeof o.total === 'number') ? answered.reduce((n, o) => n + (o.total as number), 0) : null,
+      total: answered.length === shards.length && (!dayFiltered || answered.every((o) => o.day_filtered === true)) && answered.every((o) => typeof o.total === 'number') ? answered.reduce((n, o) => n + (o.total as number), 0) : null,
       hits: answered.flatMap((o) => o.results ?? []).sort((x, y) => x.score - y.score),
     };
   };
@@ -353,7 +371,11 @@ export async function searchLocal(
       newspaper: displayTitle(t),
       date: p.date,
       city: t?.city ?? null,
-      state: t?.states?.[0] ?? t?.state ?? (picked.scope === 'national' ? null : picked.scope),
+      // When the caller asked for a state, name THAT state if the paper publishes there: a title that moved or merged
+      // ("(Atlanta, Ga.)" that was also published in Richmond) is genuinely in both, and showing only the first
+      // read as a filter that had let another state's papers through. `states` lists every state it is tagged with.
+      state: (picked.scope !== 'national' && t?.states?.includes(picked.scope)) ? picked.scope : (t?.states?.[0] ?? t?.state ?? (picked.scope === 'national' ? null : picked.scope)),
+      states: t?.states?.length ? t.states : null,
       page: p.seq,
       edition: p.edition,
       lccn,
@@ -363,6 +385,16 @@ export async function searchLocal(
     };
   }));
 
+  // A count and a payload from two different paths that disagree is a defect, not an answer. Fall back to the
+  // LoC search (and say so) rather than serve "N matches, 0 returned".
+  if (got.total != null && got.total > 0 && results.length === 0) {
+    throw new LocalStoreError(`search count (${got.total}) and rows (0) disagree`);
+  }
+  if (dayFiltered && !got.dayFilterHeld && results.length === 0 && got.hits.length > 0) {
+    throw new LocalStoreError('search partition did not apply the day range');
+  }
+
+  const complete = got.answered === shards.length;
   const scopeName = picked.scope === 'national' ? 'every U.S. state and territory' : picked.scope[0].toUpperCase() + picked.scope.slice(1);
   return {
     served_from: 'pipeworx_search',
@@ -371,12 +403,14 @@ export async function searchLocal(
     match_mode: mode === 'all' ? 'all_terms' : 'any_term',
     shards_searched: shards.length,
     shards_answered: got.answered,
+    complete,
+    missing_partitions: got.missing,
     coverage: {
       what: `Every digitized page the Library of Congress's Chronicling America holds for ${scopeName}`,
       years: [picked.year_min, picked.year_max],
       pages_searched: picked.pages,
       batches: picked.batches,
-      ...(got.answered < shards.length ? { partial: `${got.answered} of ${shards.length} search partitions answered within the time limit; results come from those` } : {}),
+      ...(!complete ? { partial: `INCOMPLETE: ${got.answered} of ${shards.length} search partitions answered within the time limit; these results come only from those, so matches in the other ${shards.length - got.answered} are missing. Repeat the same call (a slow partition is usually warm by then) or narrow the dates.` } : {}),
       ...(got.total === null && count === false ? { total_matches_note: 'not counted for questions spanning many partitions' } : {}),
     },
     data_as_of: picked.data_as_of,

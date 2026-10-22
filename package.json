@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-chronicling-america",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Chronicling America MCP — full-text search of ~150 years of digitized U.S. newspapers (1690s–present) from the Library of Congress.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-616eb1d982208e4b80345ce0795d3984944992d14b00ddcb896d70bc94f6bbf9",
-    "sourceCommit": "b0a4b8e2f3f5b3a4c3f9f2c9a73f91b20d32ce11"
+    "sourceHash": "v1-a8352f02e4cf53139031b008132089966348ff9026eb038f18b332a333534bce",
+    "sourceCommit": "712a5e0171ea24483214329d0cd7efdfd9b80352"
   }
 }
