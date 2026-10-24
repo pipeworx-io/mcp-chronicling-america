@@ -253,6 +253,22 @@ export interface LocalResult {
 
 /** National questions fan out to every shard; these bound what that costs. */
 const FANOUT_CONCURRENCY = 48;
+/** How long the local search waits for its shards before the call gives up on them and falls back to the LoC search.
+ *
+ *  SIZED ON A MEASUREMENT (fleet #3444, 2026-10-23; derivation in workers/monitor/src/search-shard-warm.ts), not a guess:
+ *    - a shard that is merely restarted answers in 1.0 s at p50, 2.0 s at p95, 7.4 s at the worst of 39 probes, whatever
+ *      its size (35 MB to 7 GB). 10 s clears that worst case with 2.6 s to spare.
+ *    - a shard that is COLD takes ~7.6 ms per MB of database: p50 24.6 s, p95 56.7 s, max 60.8 s over 23 shards. 44 of
+ *      the 54 states have a shard predicted past the 26 s wall below, and 52 of 54 past 10 s, so no deadline short of the
+ *      wall helps a cold call and one at the wall would leave the LoC fallback no time at all.
+ *    - so the deadline is bounded between 7.4 s (below it a restarted shard is wrongly written off) and the wall minus
+ *      what a LoC attempt needs (CALL_BUDGET_MS - 3 s = 23 s). 10 s keeps the whole restart range and leaves 16 s for LoC.
+ *  Cold is handled by NOT BEING COLD (the monitor touches every shard every 10 minutes; shards go cold after gateway deploys, not after idling), not by this number. A shard that
+ *  misses the deadline keeps loading after the caller has been answered, which is why the INCOMPLETE note says to repeat
+ *  the call: measured, the repeat answers in ~2 s.
+ *
+ *  Both numbers are walls on the same request: this 10 s sits INSIDE the 26 s CALL_BUDGET_MS below, which sits inside the
+ *  caller's ~45 s. Neither inner number may be raised past the outer one. */
 const FANOUT_DEADLINE_MS = 10_000;
 /** Wall budget for the whole call (local search plus any LoC fallback). The caller's own client gives up
  *  around 45s; a fallback leg is only started if it can finish inside this, never beyond it. */
