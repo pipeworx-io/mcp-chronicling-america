@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-chronicling-america",
-  "version": "0.1.7",
+  "version": "0.2.0",
   "description": "Chronicling America MCP — full-text search of ~150 years of digitized U.S. newspapers (1690s–present) from the Library of Congress.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-chronicling-america": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "chronicling-america"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-chronicling-america.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/chronicling-america",
   "pipeworx": {
-    "sourceHash": "v1-76330fb57230ec9287425abec39ec90f96bc7054d3f283c0c5551fa20fa6fed8",
-    "sourceCommit": "f1ef7a2f6b9cb1b8da1374ec2fcb28c661582b35"
+    "mode": "gateway",
+    "slug": "chronicling-america",
+    "gatewaySlug": "chronicling-america",
+    "sourceHash": "v1-25cb4ee01bad0b2ede43c622f7f65ec3a7857197f3f4465c3e7a277e41308a3f",
+    "sourceCommit": "4277282d72f9bf55e548b3799aaf737baf22152f"
   }
 }
